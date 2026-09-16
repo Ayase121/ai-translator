@@ -4,7 +4,7 @@ package com.example.aitranslator.exception;
 public class InvalidAiResponseException extends RuntimeException {
 
     public enum Reason {
-        JSON_SYNTAX, RESPONSE_STRUCTURE, SEGMENT_MAPPING, EMPTY_TRANSLATION, OTHER
+        JSON_SYNTAX, RESPONSE_STRUCTURE, SEGMENT_MAPPING, EMPTY_TRANSLATION, PROMPT_LEAKAGE, OTHER
     }
 
     private final Reason reason;

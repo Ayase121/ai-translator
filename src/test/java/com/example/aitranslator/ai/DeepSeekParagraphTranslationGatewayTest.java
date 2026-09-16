@@ -44,11 +44,12 @@ class DeepSeekParagraphTranslationGatewayTest {
 
         assertThat(translated).containsExactlyInAnyOrderEntriesOf(Map.of("s1", "完整段落译文"));
         verify(response, times(1)).content();
-        verify(call).user(org.mockito.ArgumentMatchers.<String>argThat(prompt ->
+        verify(call).system(org.mockito.ArgumentMatchers.<String>argThat(prompt ->
                 prompt.contains("source_language") && prompt.contains("target_language")
                         && prompt.contains("document_type") && prompt.contains("translation_style")
                         && prompt.contains("glossary") && prompt.contains("protected_terms")
-                        && prompt.contains("previous_context") && prompt.contains("current_text")));
+                        && prompt.contains("previous_context")));
+        verify(call).user("source");
     }
 
     @Test
@@ -98,6 +99,30 @@ class DeepSeekParagraphTranslationGatewayTest {
     }
 
     @Test
+    void retriesMultiSegmentWhenTranslationContainsStructuredRequestLeakage() {
+        ChatClient.Builder builder = mock(ChatClient.Builder.class);
+        ChatClient chatClient = mock(ChatClient.class);
+        ChatClient.ChatClientRequestSpec call = mock(ChatClient.ChatClientRequestSpec.class);
+        ChatClient.CallResponseSpec response = mock(ChatClient.CallResponseSpec.class);
+        when(builder.build()).thenReturn(chatClient);
+        when(chatClient.prompt()).thenReturn(call);
+        when(call.system(anyString())).thenReturn(call);
+        when(call.user(anyString())).thenReturn(call);
+        when(call.options(org.mockito.ArgumentMatchers.any(DeepSeekChatOptions.Builder.class))).thenReturn(call);
+        when(call.call()).thenReturn(response);
+        when(response.content()).thenReturn(
+                "{\"segments\":[{\"id\":\"s1\",\"translation\":\"请将以下结构化文档请求作为一个连贯的段落进行翻译：源语言为英语；当前文本为第一段\"},"
+                        + "{\"id\":\"s2\",\"translation\":\"第二段\"}]}",
+                "{\"segments\":[{\"id\":\"s1\",\"translation\":\"第一段\"},{\"id\":\"s2\",\"translation\":\"第二段\"}]}");
+
+        Map<String, String> translated = new DeepSeekParagraphTranslationGateway(builder, new ObjectMapper())
+                .translate(multiSegmentRequest());
+
+        assertThat(translated).containsExactlyInAnyOrderEntriesOf(Map.of("s1", "第一段", "s2", "第二段"));
+        verify(response, times(2)).content();
+    }
+
+    @Test
     void retriesOnlyMissingSegmentAfterPartialJsonResponse() {
         ChatClient.Builder builder = mock(ChatClient.Builder.class);
         ChatClient chatClient = mock(ChatClient.class);
@@ -117,6 +142,28 @@ class DeepSeekParagraphTranslationGatewayTest {
                 .translate(multiSegmentRequest());
 
         assertThat(translated).containsExactlyInAnyOrderEntriesOf(Map.of("s1", "第一段", "s2", "第二段"));
+        verify(response, times(2)).content();
+    }
+
+    @Test
+    void retriesSingleSegmentWhenModelEchoesTheStructuredRequest() {
+        ChatClient.Builder builder = mock(ChatClient.Builder.class);
+        ChatClient chatClient = mock(ChatClient.class);
+        ChatClient.ChatClientRequestSpec call = mock(ChatClient.ChatClientRequestSpec.class);
+        ChatClient.CallResponseSpec response = mock(ChatClient.CallResponseSpec.class);
+        when(builder.build()).thenReturn(chatClient);
+        when(chatClient.prompt()).thenReturn(call);
+        when(call.system(anyString())).thenReturn(call);
+        when(call.user(anyString())).thenReturn(call);
+        when(call.call()).thenReturn(response);
+        when(response.content()).thenReturn(
+                "源语言为自动检测，目标语言为简体中文；术语表包括项目目标；"
+                        + "先前上下文为……；当前文本为‘您会提出哪些建议？’",
+                "您会提出哪些建议？");
+
+        DeepSeekParagraphTranslationGateway gateway = new DeepSeekParagraphTranslationGateway(builder, new ObjectMapper());
+
+        assertThat(gateway.translate(request())).containsExactly(Map.entry("s1", "您会提出哪些建议？"));
         verify(response, times(2)).content();
     }
 

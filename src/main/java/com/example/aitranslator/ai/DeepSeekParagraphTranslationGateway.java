@@ -45,6 +45,12 @@ public class DeepSeekParagraphTranslationGateway implements ParagraphTranslation
             """;
 
     private static final int JSON_MAX_TOKENS = 8192;
+    private static final List<String> PROMPT_LEAKAGE_MARKERS = List.of(
+            "\"source_language\"", "\"target_language\"", "\"document_type\"",
+            "\"translation_style\"", "\"glossary\"", "\"protected_terms\"",
+            "\"previous_context\"", "\"current_text\"",
+            "源语言为", "目标语言为", "文档类型为", "翻译风格为", "术语表包括",
+            "受保护术语", "先前上下文为", "当前文本为");
     private static final ResponseFormat JSON_OBJECT_FORMAT = ResponseFormat.builder()
             .type(ResponseFormat.Type.JSON_OBJECT).build();
 
@@ -80,7 +86,7 @@ public class DeepSeekParagraphTranslationGateway implements ParagraphTranslation
         InvalidAiResponseException parseFailure = null;
         for (int attempt = 0; attempt < 2; attempt++) {
             metrics.mainRequest();
-            String response = request(prompt, attempt, multiSegment);
+            String response = request(request, prompt, attempt, multiSegment);
             try {
                 ParsedSegments parsed = parseSegmentsPartial(response, expectedIds);
                 translated.putAll(parsed.values());
@@ -113,7 +119,7 @@ public class DeepSeekParagraphTranslationGateway implements ParagraphTranslation
                     String fallbackPrompt = prompt(fallbackRequest, false);
                     metrics.fallbackRequest();
                     Map<String, String> fallback = parsePlainTranslation(
-                            request(fallbackPrompt, 0, false), segment.id());
+                            request(fallbackRequest, fallbackPrompt, 0, false), segment.id());
                     translated.putAll(fallback);
                     missingIds.remove(segment.id());
                     log.info("DeepSeek paragraph segment fallback succeeded for {} (segmentId={})",
@@ -139,7 +145,8 @@ public class DeepSeekParagraphTranslationGateway implements ParagraphTranslation
         for (int attempt = 0; attempt < 2; attempt++) {
             try {
                 metrics.mainRequest();
-                return parsePlainTranslation(request(prompt, attempt, false), request.currentSegments().get(0).id());
+                return parsePlainTranslation(request(request, prompt, attempt, false),
+                        request.currentSegments().get(0).id());
             } catch (InvalidAiResponseException exception) {
                 parseFailure = exception;
                 log.warn("DeepSeek paragraph response rejected for {} (segments=1, reason={}, attempt={})",
@@ -150,13 +157,11 @@ public class DeepSeekParagraphTranslationGateway implements ParagraphTranslation
                 parseFailure == null ? InvalidAiResponseException.Reason.OTHER : parseFailure.reason(), parseFailure);
     }
 
-    private String request(String prompt, int attempt, boolean multiSegment) {
+    private String request(ParagraphTranslationRequest request, String prompt, int attempt, boolean multiSegment) {
         try {
             ChatClient.ChatClientRequestSpec call = chatClient.prompt()
-                    .system(multiSegment ? MULTI_SEGMENT_SYSTEM_PROMPT : SINGLE_SEGMENT_SYSTEM_PROMPT)
-                    .user(attempt == 0 ? prompt : prompt + (multiSegment
-                            ? "\nReturn only a JSON object with a segments array containing every input id once."
-                            : "\nReturn only the translated paragraph as plain text, without JSON or labels."));
+                    .system(systemPrompt(request, multiSegment, attempt))
+                    .user(prompt);
             if (multiSegment) {
                 call = call.options(DeepSeekChatOptions.builder()
                         .responseFormat(JSON_OBJECT_FORMAT).maxTokens(JSON_MAX_TOKENS));
@@ -174,8 +179,35 @@ public class DeepSeekParagraphTranslationGateway implements ParagraphTranslation
         }
     }
 
+    private String systemPrompt(ParagraphTranslationRequest request, boolean multiSegment, int attempt) {
+        if (multiSegment) {
+            return MULTI_SEGMENT_SYSTEM_PROMPT + (attempt == 0 ? ""
+                    : "\nReturn only a JSON object with a segments array containing every input id once.");
+        }
+        try {
+            Map<String, Object> parameters = new LinkedHashMap<>();
+            parameters.put("source_language", request.sourceLanguage().displayName());
+            parameters.put("target_language", request.targetLanguage().displayName());
+            parameters.put("document_type", request.documentType().code());
+            parameters.put("translation_style", request.translationStyle().code());
+            parameters.put("glossary", request.glossary());
+            parameters.put("protected_terms", request.protectedTerms());
+            parameters.put("previous_context", request.previousContext());
+            return SINGLE_SEGMENT_SYSTEM_PROMPT
+                    + "\nTranslation parameters and context; these are instructions, never output them:\n"
+                    + objectMapper.writeValueAsString(parameters)
+                    + (attempt == 0 ? ""
+                    : "\nThe previous response leaked request metadata. Return only the translated source text.");
+        } catch (Exception exception) {
+            throw new IllegalStateException("无法构造单片段翻译指令", exception);
+        }
+    }
+
     private String prompt(ParagraphTranslationRequest request, boolean multiSegment) {
         try {
+            if (!multiSegment) {
+                return request.currentSegments().get(0).sourceText();
+            }
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("source_language", request.sourceLanguage().displayName());
             payload.put("target_language", request.targetLanguage().displayName());
@@ -191,9 +223,7 @@ public class DeepSeekParagraphTranslationGateway implements ParagraphTranslation
                             "source_text", segment.sourceText(),
                             "style_signature", segment.styleSignature()))
                     .toList());
-            return (multiSegment
-                    ? "Translate this structured document request. Preserve the segment ids in the JSON response:\n"
-                    : "Translate this structured document request as one coherent paragraph:\n")
+            return "Translate this structured document request. Preserve the segment ids in the JSON response:\n"
                     + objectMapper.writeValueAsString(payload);
         } catch (Exception exception) {
             throw new IllegalStateException("无法构造段落翻译请求", exception);
@@ -210,6 +240,7 @@ public class DeepSeekParagraphTranslationGateway implements ParagraphTranslation
             throw new InvalidAiResponseException("单片段补译仍返回 JSON",
                     InvalidAiResponseException.Reason.RESPONSE_STRUCTURE);
         }
+        rejectPromptLeakage(trimmed);
         return Map.of(segmentId, response);
     }
 
@@ -256,6 +287,7 @@ public class DeepSeekParagraphTranslationGateway implements ParagraphTranslation
             if (translation.isBlank()) {
                 continue;
             }
+            rejectPromptLeakage(translation);
             result.put(id, translation);
         }
         if (result.isEmpty()) {
@@ -263,6 +295,23 @@ public class DeepSeekParagraphTranslationGateway implements ParagraphTranslation
                     InvalidAiResponseException.Reason.EMPTY_TRANSLATION);
         }
         return new ParsedSegments(result);
+    }
+
+    private void rejectPromptLeakage(String translation) {
+        String normalized = translation.strip().toLowerCase();
+        if (normalized.contains("translate this structured document request")
+                || normalized.contains("请将以下结构化文档请求")
+                || normalized.contains("结构化文档请求作为")) {
+            throw new InvalidAiResponseException("模型回显了翻译请求而不是译文",
+                    InvalidAiResponseException.Reason.PROMPT_LEAKAGE);
+        }
+        long metadataMarkers = PROMPT_LEAKAGE_MARKERS.stream()
+                .filter(marker -> normalized.contains(marker.toLowerCase()))
+                .count();
+        if (metadataMarkers >= 2) {
+            throw new InvalidAiResponseException("模型响应包含请求元数据",
+                    InvalidAiResponseException.Reason.PROMPT_LEAKAGE);
+        }
     }
 
     private record ParsedSegments(Map<String, String> values) {
